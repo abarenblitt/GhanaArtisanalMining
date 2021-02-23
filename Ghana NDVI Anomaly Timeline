@@ -1,0 +1,262 @@
+//=====================================================================================================================
+//                                        MIT - NASA - University of Maryland (ESSIC)
+// Remote Sensing of Land Cover and Ecosystems: Country-level Ecosystem Extent and Change Mapping in Sub-Saharan Africa
+//                                                  
+// Project: Small-scale Gold Mining in Ghana 
+// Code: Ghana NDVI Anomaly Timeline
+// Written by: Amanda Payton, NASA Goddard 
+// Edited by: Abigail Barenblitt NASA Goddard and University of Maryland 
+// Co-authors: Daniel Wood, MIT; Lola Fatoyinbo, NASA Goddard; David Lagomasino, East Carolina University
+// Objective: This code identifies the year of highest NDVI decrease per pixel, 
+//            creates an image to display the year, exports the image, and calculates the area per year.
+
+//=====================================================================================================================
+
+
+//=======================================================================================
+//STEP 1: Create a collection of Landsat Images 
+//=======================================================================================
+
+// // Set region
+var region = countries.filterMetadata("country_na","equals","Ghana");
+
+// Define years and dates to include in landsat image collection
+var startYear = 2002;         //what year do you want to start the time series 
+var endYear   = 2019;         //what year do you want to end the time series
+var startDay  = '01-01';      //what is the beginning of date filter | month-day
+var endDay    = '06-30';      //what is the end of date filter | month-day
+
+
+// Create a harmonization function between the L7 and L8 sensors   //// citation: Roy, D.P., Kovalskyy, V., Zhang, H.K., Vermote, E.F., Yan, L., Kumar, S.S, Egorov, A., 2016, Characterization of Landsat-7 to Landsat-8 reflective wavelength and normalized difference vegetation index continuity, Remote Sensing of Environment, 185, 57-70.(http://dx.doi.org/10.1016/j.rse.2015.12.024); Table 2 - reduced major axis (RMA) regression coefficients
+var harmonizationRoy = function(oli) {
+  var slopes = ee.Image.constant([0.9785, 0.9542, 0.9825, 1.0073, 1.0171, 0.9949]);        // create an image of slopes per band for L8 TO L7 regression line - David Roy
+  var itcp = ee.Image.constant([-0.0095, -0.0016, -0.0022, -0.0021, -0.0030, 0.0029]);     // create an image of y-intercepts per band for L8 TO L7 regression line - David Roy
+  var y = oli.select(['B2','B3','B4','B5','B6','B7'],['B1', 'B2', 'B3', 'B4', 'B5', 'B7']) // select OLI bands 2-7 and rename them to match L7 band names
+            .resample('bicubic')                                                          // ...resample the L8 bands using bicubic
+            .subtract(itcp.multiply(10000)).divide(slopes)                                // ...multiply the y-intercept bands by 10000 to match the scale of the L7 bands then apply the line equation - subtract the intercept and divide by the slope
+            .set('system:time_start', oli.get('system:time_start'));                      // ...set the output system:time_start metadata to the input image time_start otherwise it is null
+  return y.toShort();                                                                      // return the image as short to match the type of the other data
+};
+
+
+// Create a function to get a sensor SR collection from L7 and L8 using the harmonization function
+var getSRcollection = function(startYear, startDay, endYear, endDay, sensor) {      // get a landsat collection for given year, day range, and sensor
+  var srCollection = ee.ImageCollection('LANDSAT/'+ sensor + '/C01/T1_SR')     // get surface reflectance images
+                      .filterDate(startYear+'-'+startDay, endYear+'-'+endDay)     // filter them by year and day range
+                      .filterBounds(region);                                 //filter to the region
+  
+  srCollection = srCollection.map(function(img) {                          // apply the harmonization function to LC08 (if LC08), subset bands, unmask, and resample
+    var dat = ee.Image(ee.Algorithms.If(
+        sensor == 'LC08',                                                  // condition - if image is OLI
+        harmonizationRoy(img.unmask()),                                    // true - then apply the L8 TO L7 alignment function after unmasking pixels that were previosuly masked (why/when are pixels masked)
+        img.select(['B1', 'B2', 'B3', 'B4', 'B5', 'B7'])                   // false - else select out the reflectance bands from the non-OLI image
+          .unmask()                                                       // ...unmask any previously masked pixels 
+          .resample('bicubic')                                            // ...resample by bicubic 
+          .set('system:time_start', img.get('system:time_start'))         // ...set the output system:time_start metadata to the input image time_start otherwise it is null
+      ));
+    var qa = img.select('pixel_qa');                                       // make a cloud, cloud shadow, and snow mask from fmask band
+    var mask = qa.bitwiseAnd(8).eq(0).and(                                 // include shadow
+            qa.bitwiseAnd(16).eq(0)).and(                                 // include snow
+            qa.bitwiseAnd(32).eq(0));                                     // include clouds
+  
+    return dat.mask(mask); //apply the mask - 0's in mask will be excluded from computation and set to opacity=0 in display
+  });
+    return srCollection; // return the prepared collection
+};
+
+
+// Create function to combine L7 and L8 data to form a collection
+var getCombinedSRcollection = function(startYear, startDay, endYear,endDay) {
+    var le5 = getSRcollection(startYear, startDay, endYear, endDay, 'LT05');      // get TM collection for a given year, date range, and area
+    var le7 = getSRcollection(startYear, startDay, endYear, endDay, 'LE07');       // get ETM+ collection for a given year, date range, and area
+    var lc8 = getSRcollection(startYear, startDay, endYear, endDay, 'LC08');       // get OLI collection for a given year, date range, and area
+    var mergedCollection = ee.ImageCollection(le7.merge(lc8));     // merge the individual sensor collections into one imageCollection object
+    return mergedCollection;                                                  // return the Imagecollection
+};
+
+
+// Create function to add vegetation indices to the collections
+var addvars = function(image) {
+    var ndvi = image.normalizedDifference(['B4', 'B3']).rename('NDVI'); //calculate NDVI
+    return image.addBands(ndvi); //adds index as a band
+};
+ 
+
+// Create a function that adds a year band to the collection
+var addYear = function(image){
+  var date = ee.Date(image.get('system:time_start')).get('year');
+  var year = ee.Image(date).subtract(2000).rename('Year').byte(); //get Year of Image (after 2000)
+  return image.addBands(year); //add as band
+};
+
+
+//Apply functions
+var collectionSR = getCombinedSRcollection(startYear, startDay,endYear,endDay); //make a landsat collection
+var collectionSR_wIndex = collectionSR.map(addvars); //add vegetation indices
+var collection_IndexYear = collectionSR_wIndex.map(addYear); //add year band
+
+// Visualize Landsat Observation Image
+var obsstart = '2010-01-01'; //date to start observation period
+var obsend = '2019-06-30'; //date to end observation period
+
+
+
+//=======================================================================================
+//STEP 2: Create Image of Greatest NDVI Decrease Per Year
+//=======================================================================================
+
+//loop through image collection and get a maximum image for each year
+var maxCollection = ee.ImageCollection(ee.List.sequence(startYear,endYear).map(function(year){ 
+  return collection_IndexYear.filter(ee.Filter.calendarRange(year,year,'year')).max().set('Year', year);
+}));
+
+
+var maxList = ee.List(maxCollection.toList(maxCollection.size())); //convert image collection to list
+print('Max List of Annual Images',maxList);
+
+
+//function to get 3-year moving average
+var myFunction = function(i){
+    var nextYear = ee.Number(i).add(1);
+    var previousYear = ee.Number(i).add(-1)
+    
+    var nextY = ee.Image(maxList.get(nextYear)); // next image in collection
+    var thisYear = ee.Image(maxList.get(i)); //current image in collection
+    var previousY =  ee.Image(maxList.get(previousYear));//previous year in collection
+    
+    
+    var avg = thisYear.select('NDVI').add(nextY.select('NDVI')).add(previousY.select('NDVI')).divide(3) // Calculate average of this image and next image in collection
+    .multiply(-1).rename('NDVI_avg'); //multiply by -1 to flip average (we want loss not gain)
+  return ee.Image(maxList.get(i)).addBands(avg);    // Add Moving average band 
+  };
+
+var listSequence = ee.List.sequence(1,maxList.size().subtract(2));
+var avgCollection = ee.ImageCollection(listSequence.map(myFunction));// AS IMAGE COLLECTION
+
+
+
+var avgList = ee.List(avgCollection.toList(avgCollection.size()));// AS LIST
+
+
+//function to get derivative of NDVI curve (max change between years)
+var myFunction2 = function(i){
+    var aaa = ee.Number(i).add(1);
+    var bbb = ee.Image(avgList.get(aaa)); // next image in collection
+    var ccc = ee.Image(avgList.get(i)); //current image in collection
+    var avg = bbb.select('NDVI_avg').subtract(ccc.select('NDVI_avg')).rename('NDVI_deriv');
+  return  ee.Image(avgList.get(i)).addBands(avg);
+};
+
+
+
+var listSequence2 = ee.List.sequence(0,avgList.size().subtract(2));
+var derivCollection = ee.ImageCollection(listSequence2.map(myFunction2)); // AS IMAGE COLLECTION
+
+
+//Reduce collection to get year of maximum derivative
+var derivMosaic = derivCollection.qualityMosaic('NDVI_deriv') ; // Quality Mosaic based on max derivative
+
+var derivativeMaxYear = derivMosaic.select('Year'); // select the Year of max derivative 
+
+
+//=======================================================================================
+//STEP 3: Get Area Per Year 2007-2017 and Chart
+//=======================================================================================
+
+var years = ee.List.sequence(7,17,1);
+
+var getArea = ee.FeatureCollection(years.map(function(i){
+    var year = ee.Number(i);
+    var def = minesYear.eq(year);
+    var defArea = def.multiply(ee.Image.pixelArea()).divide(10000).reduceRegion({
+      reducer:ee.Reducer.sum(),
+      geometry:region,
+      scale: 100,
+      maxPixels:1e13,
+      tileScale: 16
+      }).get('Year');
+  return ee.Feature(null).set('Area', defArea).set('Year',year);
+}));
+
+//Construct Bar Chart
+
+var options = {
+  title: 'Mining Area by Year',
+  vAxis: {title: 'Area in Hectares'},
+  legend: {position: 'none'},
+  hAxis: {
+    title: 'Year',
+    logScale: false
+  }
+};
+
+var areaChart = getArea.select(['Year','Area'])
+
+print(areaChart.getInfo())
+
+var chart = ui.Chart.feature.byFeature(areaChart,'Year');
+var chart = chart.setChartType('ColumnChart')
+var chart = chart.setOptions(options)
+print(chart)
+
+
+
+//=======================================================================================
+//STEP 4: Map results
+//=======================================================================================
+//Set up visualization
+var palette = ['#4B0082', '#9400D3',  '#0000FF', '#00FF00', '#FFFF00', '#FF7F00', '#FF0000'];
+var yodVizParms = {
+  min: 7,
+  max: 17,
+  palette: palette
+};
+
+// Map of Loss Year based on Maximum NDVI Derivative
+
+//Get mines and clean
+var final_mines = rf_class.select(0).eq(1).selfMask();
+
+//Set Variables
+var mines = final_mines;
+var scale = 30;
+
+var minesMaxYear = derivativeMaxYear.updateMask(mines).clip(studyArea);
+
+// Map of Loss Year based on Maximum NDVI Derivative
+Map.addLayer(minesMaxYear,yodVizParms,'Max Derivative Year',true);
+
+
+//Observation Period Landsat Imagery
+Map.addLayer(collection_IndexYear.filterDate(obsstart,obsend).median().clip(region), {bands: ['B3', 'B2', 'B1'], min:200, max:1500}, 'Landsat Image', false);
+
+//NDVI Average Collection
+Map.addLayer(avgCollection.select("NDVI_avg"), {}, 'Average Collection', false);
+
+//Derivative NDVI Collection
+Map.addLayer(derivCollection.select('NDVI_deriv'), {}, 'Derivative Collection', false)
+
+
+//=======================================================================================
+//STEP 5: Export layers
+//=======================================================================================
+
+// //Export Area Table
+// print('Area Collection',getArea);
+// Export.table.toDrive({
+//   collection:getArea, 
+//   description: "Ghana_Area_RF"
+//   });
+
+// //Export mines classification image
+// Export.image.toDrive({
+//   image: minesMaxYear.clip(studyArea),
+//   description: 'Ghana_MinesRF_30m_MaxYear3YrAvg2019Full',
+//   region: region,
+//   scale: scale,
+//   maxPixels: 1e13
+// });
+
+//****************************************************************************************************************************
+
+///END CODE///
