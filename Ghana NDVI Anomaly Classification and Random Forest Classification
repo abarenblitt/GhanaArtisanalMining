@@ -1,0 +1,623 @@
+//=====================================================================================================================
+//                                        MIT - NASA - University of Maryland (ESSIC)
+// Remote Sensing of Land Cover and Ecosystems: Country-level Ecosystem Extent and Change Mapping in Sub-Saharan Africa
+//                                                  
+// Project: Small-scale Gold Mining in Ghana 
+// Code: Ghana NDVI Anomaly Classification and Random Forest Classification
+// Written by: Amanda Payton, NASA Goddard 
+// Edited by: Abigail Barenblitt NASA Goddard and University of Maryland 
+// Co-authors: Daniel Wood, MIT; Lola Fatoyinbo, NASA Goddard; David Lagomasino, East Carolina University
+// Objective: This code identifies areas of anomalous NDVI in Ghana from 2008 to 2019 and classifies those areas
+//            to identify small-scale gold mining, then exports the mines image to an asset
+
+//=====================================================================================================================
+
+
+
+//=======================================================================================
+//STEP 1: Create a collection of Landsat Images 
+//=======================================================================================
+//This will assemble Landsat imagery from 2002-2019 and harmonize imagery from
+//Landsat 5,7, & 8
+
+//Define region of interest 
+//--------------------------
+var region = countries.filterMetadata("country_na","equals","Ghana"); //country border of Ghana
+ 
+
+
+// Define years and dates to include in landsat image collection
+//---------------------------------------------------------------
+var startYear = 1990;         //what year do you want to start the time series 
+var endyear   = 2019;         //what year do you want to end the time series
+var startDay  = '01-01';      //what is the beginning of date filter | month-day
+var endDay    = '12-31';      //what is the end of date filter | month-day
+
+ 
+// Create a harmonization function between the L7 and L8 sensors   //// citation: Roy, D.P., Kovalskyy, V., Zhang, H.K., Vermote, E.F., Yan, L., Kumar, S.S, Egorov, A., 2016, Characterization of Landsat-7 to Landsat-8 reflective wavelength and normalized difference vegetation index continuity, Remote Sensing of Environment, 185, 57-70.(http://dx.doi.org/10.1016/j.rse.2015.12.024); Table 2 - reduced major axis (RMA) regression coefficients
+//--------------------------------------------------------------
+var harmonizationRoy = function(oli) {
+    var slopes = ee.Image.constant([0.9785, 0.9542, 0.9825, 1.0073, 1.0171, 0.9949]);        // create an image of slopes per band for L8 TO L7 regression line - David Roy
+    var itcp = ee.Image.constant([-0.0095, -0.0016, -0.0022, -0.0021, -0.0030, 0.0029]);       // create an image of y-intercepts per band for L8 TO L7 regression line - David Roy
+    var y = oli.select(['B2','B3','B4','B5','B6','B7'],['B1', 'B2', 'B3', 'B4', 'B5', 'B7'])    // select OLI bands 2-7 and rename them to match L7 band names
+              .resample('bicubic')                                                             // ...resample the L8 bands using bicubic
+              .subtract(itcp.multiply(10000)).divide(slopes)                                   // ...multiply the y-intercept bands by 10000 to match the scale of the L7 bands then apply the line equation - subtract the intercept and divide by the slope
+              .set('system:time_start', oli.get('system:time_start'));                         // ...set the output system:time_start metadata to the input image time_start otherwise it is null
+    
+    return y.toShort();                                                                        // return the image as short to match the type of the other data
+  };
+
+
+// Create a function to get a sensor SR collection from L7 and L8 using the harmonization function
+//------------------------------------------------------------------------------------------------
+var getSRcollection = function(year, startDay, endYear, endDay, sensor) {      // get a landsat collection for given year, day range, and sensor
+    var srCollection = ee.ImageCollection('LANDSAT/'+ sensor + '/C01/T1_SR')     // get surface reflectance images
+                        .filterDate(year+'-'+startDay, endYear+'-'+endDay)     // filter them by year and day range
+                        .filterBounds(region);                                 //filter to the region
+  
+  srCollection = srCollection.map(function(img) {                          // apply the harmonization function to LC08 (if LC08), subset bands, unmask, and resample
+      var dat = ee.Image(ee.Algorithms.If(
+          sensor == 'LC08',                                                  // condition - if image is OLI
+          harmonizationRoy(img.unmask()),                                    // true - then apply the L8 TO L7 alignment function after unmasking pixels that were previosuly masked (why/when are pixels masked)
+          img.select(['B1', 'B2', 'B3', 'B4', 'B5', 'B7'])                   // false - else select out the reflectance bands from the non-OLI image
+            .unmask()                                                       // ...unmask any previously masked pixels 
+            .resample('bicubic')                                            // ...resample by bicubic 
+            .set('system:time_start', img.get('system:time_start'))         // ...set the output system:time_start metadata to the input image time_start otherwise it is null
+        ));
+      var qa = img.select('pixel_qa');                                       // make a cloud, cloud shadow, and snow mask from fmask band
+      var mask = qa.bitwiseAnd(8).eq(0).and(                                 // include shadow
+              qa.bitwiseAnd(16).eq(0)).and(                                 // include snow
+              qa.bitwiseAnd(32).eq(0));                                     // include clouds
+  
+      return dat.mask(mask); //apply the mask - 0's in mask will be excluded from computation and set to opacity=0 in display
+    });
+      return srCollection; // return the prepared collection
+  };
+
+
+// Create function to combine L5, L7, L8 data to form a collection
+//-----------------------------------------------------------------
+var getCombinedSRcollection = function(startyear, startDay, endYear,endDay) {
+      var le5 = getSRcollection(startyear, startDay, endYear, endDay, 'LT05');      // get TM collection for a given year, date range, and area
+      var le7 = getSRcollection(startyear, startDay, endYear, endDay, 'LE07');       // get ETM+ collection for a given year, date range, and area
+      var lc8 = getSRcollection(startyear, startDay, endYear, endDay, 'LC08');       // get OLI collection for a given year, date range, and area
+      var mergedCollection = ee.ImageCollection(le7.merge(lc8).merge(le5));          // merge the individual sensor collections into one imageCollection object
+    
+      return mergedCollection;                                                  // return the Imagecollection
+  };
+
+
+// Create function to add NDVI band to L7 and L8 Collections
+//----------------------------------------------------------
+var addvars = function(image) {
+        var ndvi = image.normalizedDifference(['B4', 'B3']).rename('NDVI');
+        
+        return image.addBands(ndvi); //adds each index as a band
+  };
+
+
+//Apply functions
+//---------------
+var collectionSR = getCombinedSRcollection(startYear, startDay,endyear,endDay); //make a landsat collection
+var collectionSR_wIndex = collectionSR.map(addvars); //add vegetation indices
+
+//****************************************************************************************************************************
+
+
+
+
+
+
+//=======================================================================================
+//STEP 2: Identify areas of deforestation
+//=======================================================================================
+
+//Create a function that calculates a mean NDVI for a reference period and subtracts 
+//that mean from each image of an observation period
+//-----------------------------------------------------------------------------------
+
+//Reference Period
+//----------------
+var refstart = '2002-01-01'; //date to start reference period
+var refend = '2005-12-31'; //date to end reference period
+
+var reference = collectionSR_wIndex.filterDate(refstart,refend); //filter collection to reference dates 
+var refMean = reference.median(); //get mean value of reference collection
+
+
+//Observation Period
+//------------------
+var obsstart = '2010-01-01'; //date to start observation period
+var obsend = '2019-12-31'; //date to end observation period
+
+var observation = collectionSR_wIndex.filterDate(obsstart,obsend).map(function(image) {
+    return image.select('NDVI').subtract(refImg.select('NDVI')) //subtract the average NDVI from reference period from the image
+              .set('system:time_start', image.get('system:time_start')); // Copy the date properties over to the new collection.
+  });
+
+
+// Current Imagery for Visual Comparison
+//---------------------------------------
+var currentImage = collectionSR_wIndex.filterDate('2017-01-01','2019-01-01').median()
+
+
+//Identify anomalies in NDVI loss over time
+//---------------------------------------------
+var anomaly = observation.select('NDVI').sum();// Sum of the observations
+var numimages = observation.select('NDVI').count();// Determine the number of good images for each pixel
+var anomMean = anomaly.divide(numimages);// Divide the sum by the number of images to correct for number of images in collection
+
+
+//Mask the anomaly image based on threshold of interest
+//------------------------------------------------------
+var loss = anomMean.lte(-0.15).selfMask(); //create image of NDVI decrease of 0.15 or more
+
+//****************************************************************************************************************************
+
+
+
+
+
+
+//=======================================================================================
+//STEP 3:Classify areas of gold mining within deforestation areas
+//=======================================================================================
+
+//Define classifcation variables
+//-------------------------------
+var image = currentImg//.updateMask(loss);
+var bands = ['B1', 'B2', 'B3', 'B4', 'B5', 'B7']; //choose bands used in classification
+var image2 = image.select(bands);
+var scale = 30; //scale for classification
+
+
+//Supervised Classification
+//--------------------------
+//Create training site feature using Geomtry Imports Tool
+//--------------------------------------------------------
+var polygons = ee.FeatureCollection(water.merge(mining).merge(urban).merge(vegetation));
+
+var mine2 = image2.sampleRegions({
+        collection: mining,
+        properties:['class'],
+        scale:scale
+    });
+    
+var veg2 = image2.sampleRegions({
+        collection: vegetation,
+        properties:['class'],
+        scale:scale
+    });
+    
+var wat2 = image2.sampleRegions({
+        collection: water,
+        properties:['class'],
+        scale:scale
+    });
+
+var urb2 = image2.sampleRegions({
+        collection: urban,
+        properties:['class'],
+        scale:scale
+    });
+
+var training = image2.sampleRegions({
+        collection: polygons,
+        properties:['class'],
+        scale:scale
+    });
+
+//Get number of training points
+//------------------------------
+print('Training n =', training.aggregate_count('.all'));
+print('Training Mining n =', mine2.aggregate_count('.all'));
+print('Training Veg n =', veg2.aggregate_count('.all'));
+print('Training Urban n =', urb2.aggregate_count('.all'));
+print('Training Water n =', wat2.aggregate_count('.all'));
+
+//Random Forest Model Construction
+//--------------------------------
+var random_forest = ee.Classifier.smileRandomForest({
+                    variablesPerSplit: 3,//The number of variables per split
+                    numberOfTrees: 150     //The number of Rifle decision trees to create per class
+      });
+var trainRF = random_forest.train({
+              features: training,
+              classProperty: 'class',
+              inputProperties: bands
+      });
+
+
+//Classify landcover types and run the model
+//-------------------------------------------
+var classRF = image2.clip(region).classify(trainRF);
+
+
+//Clean up classification to eliminate small clusters of pixels
+// This reduces noise in the results to display areas that are likely mines rather 
+// than small disturbances or anomolies
+//-------------------------------------------------------------
+var cleanRF = classRF.reduceNeighborhood({ //run classification through a neighborhood filter
+                reducer: ee.Reducer.mode(), //choose most common value in neighborhood
+                kernel: ee.Kernel.square(2,'pixels') //define neighborhood
+      });
+
+var pixelcount = cleanRF.connectedPixelCount(100, false); //Create an image that shows the number of pixels each pixel is connected to
+var countmask = pixelcount.select(0).gt(25); //filter out all pixels connected to 4 or less 
+var final_RF = cleanRF.updateMask(countmask).updateMask(loss); //mask classfication image to exclude small patches
+var final_RF2 = final_RF.select(0).gte(0).selfMask()
+
+//Calculate and print total mining area
+//-------------------------------------
+
+//Filter out the mining landcover type
+var final_mines = RFExp.select(0).eq(1).selfMask();
+// var final_mines = rfMines.updateMask(countmask); //mask classfication image to exclude small patches
+
+var mineTotal = ee.Number(final_mines.gt(0).selfMask().multiply(ee.Image.pixelArea()).reduceRegion({
+                   geometry: region.geometry(),
+                   reducer: ee.Reducer.sum(),
+                   scale:30, 
+                   maxPixels: 1e16,
+                   crs:'EPSG:4326',
+                   }).get('classification_mode')).divide(10000)
+  
+print(mineTotal, 'Total Mining in Hectares')
+
+//****************************************************************************************************************************
+
+
+
+
+
+// =======================================================================================
+// STEP 4: Create random points for export for accuracy assessment in QGIS
+// =======================================================================================
+
+//These points were created in GEE using Stratified Random Sampling (see below)
+//We then used the Class Accuracy plug-in (Pete Bunting) to classify each point using
+//WorldView data as validation
+
+//Creating Stratified Random Samples
+//----------------------------------
+var stratSamples = RFExp.stratifiedSample({
+                      numPoints:150,
+                      classBand: 'classification_mode',
+                      region:wvOutline,
+                      scale: 30,
+                      geometries:true
+        });
+
+
+//Add a 15m Radius buffer around each point
+//-----------------------------------------
+var stratBuff = function(feature) {
+        var num = feature.get('classification_mode');
+            
+        return feature.buffer(15).set('classification_mode', num);
+        };
+
+
+//Map the buffer across all points (see export code below in Step 6)
+//--------------------------------------------------------
+var stratPoints = stratSamples.map(stratBuff)
+
+//****************************************************************************************************************************
+
+
+
+
+
+
+// =======================================================================================
+// STEP 5: Create confusion matrix and run accuracy assessment
+// =======================================================================================
+
+// Get a confusion matrix representing resubstitution accuracy.
+//-------------------------------------------------------------
+var trainAccuracy = trainRF.confusionMatrix();
+
+print('Resubstitution error matrix: ', trainAccuracy);
+print('Training overall accuracy: ', trainAccuracy.accuracy());
+
+
+//Pull in points classified using QGIS. These points were taken from the
+// previous code and correctly classified using WorldView Imagery
+//----------------------------------------------------------------------
+var pointsNew = accPoints
+
+
+//----------------------------
+//Landcover classification key
+//----------------------------
+
+// Vegetation            = 0
+// Mines                 = 1
+// Urban                 = 2
+// Water                 = 3
+// Mixed (hard to class) = 4
+
+
+//The shapefile containing the points used for accuracy assessment have results
+// in String format. This function converts them to Integer format
+//------------------------------------------------------------------------------
+var remapFunc = function(feature) {
+      var num = ee.Number.parse(feature.get('LandOut'));
+    
+      return feature.set('LandOut', num);
+  
+    };
+
+
+// Map the  function over the FeatureCollection.
+//----------------------------------------------
+var numFixed = pointsNew.map(remapFunc);
+print(numFixed)
+
+//Sample the model results using randomly sampled points
+//------------------------------------------------------
+var training2 = RFExp.sampleRegions({
+                  collection: numFixed,
+                  properties:['LandOut'],
+                  scale:30,
+          });
+print(training2)
+
+
+// Classify the validation data.
+//------------------------------
+//var validated = training2.classify(trainRF);
+
+
+// Get a confusion matrix representing expected accuracy.
+//-------------------------------------------------------
+var testAccuracy = training2.errorMatrix('classification_mode','LandOut',[0,1,2,3,4]);
+
+print('Validation error matrix: ', testAccuracy); //Generates the error matrix to demonstrate accuracy by landcover class type
+print('Validation overall accuracy: ', testAccuracy.accuracy());
+
+
+//Show variable importance
+//-------------------------
+print('Explain',trainRF.explain())
+
+//****************************************************************************************************************************
+
+
+
+
+
+
+
+
+
+//=======================================================================================
+//STEP 6a: Analysis of Protect Areas
+//=======================================================================================
+
+//Filter Protected areas to Study Area
+var ghanaProtect = protArea.filterMetadata('ISO3', 'equals', 'GHA').filterBounds(studyArea)
+print(ghanaProtect,'ghana')
+
+//Run function to calculate and map areas of gold mining for all protected areas in Study Area
+print(final_mines,'final')
+var areaFunc = ghanaProtect.map(function(feature) {
+      var mines = final_mines.clip(studyArea).gt(0).selfMask().multiply(ee.Image.pixelArea()).divide(10000).reduceRegion({
+                   geometry: feature.geometry(),
+                   reducer: ee.Reducer.sum(),
+                   scale:30, 
+                   maxPixels: 1e13,
+                   }).get('classification_mode');
+    
+      return feature.set('TotalMiningArea', mines);
+  
+    });
+
+
+var options3 = {
+  title: 'Mining Loss Protected Areas',
+  vAxis: {title: 'Area in Hectares'},
+  legend: {position: 'none'},
+  hAxis: {
+    title: 'WDPA',
+    logScale: false
+  }
+};
+
+var wdpaChart = areaFunc.select(['NAME','TotalMiningArea'])
+
+//print(areaChart.getInfo())
+
+var chart3 = ui.Chart.feature.byFeature(wdpaChart,'NAME');
+var chart3 = chart3.setChartType('ColumnChart')
+var chart3 = chart3.setOptions(options3)
+
+print(chart3)
+
+
+
+
+
+//=======================================================================================
+//STEP 6: Export layers
+//=======================================================================================
+
+// Anomaly Mean Image
+// --------------------
+// Export.image.toAsset({
+//     image: anomMean,
+//     description: 'Ghana_anomalyMean_2010_2019Full',
+//     region: region,
+//     scale: 30,
+//     maxPixels: 1e13
+//   });
+
+
+// NDVI Loss Image
+//-----------------
+// Export.image.toAsset({
+//     image: loss,
+//     description: 'Ghana_landCover_Loss_2010_2019Full',
+//     region: region,
+//     scale: 30,
+//     maxPixels: 1e13
+//   });
+
+
+// Current Landsat Image
+// ----------------------
+// Export.image.toAsset({
+//     image: currentImage,
+//     description: 'CurrentImage',
+//     region: region,
+//     scale: 30,
+//     maxPixels: 1e13
+//   });
+
+
+//Reference Landsat Image
+//-----------------------
+// Export.image.toAsset({
+//    image: refMean,
+//    description: 'ReferenceLandsatImg',
+//    region: region,
+//    scale: 30,
+//    maxPixels: 1e13
+//   });
+
+
+// Random Forest Classification Results
+//-------------------------------------
+
+
+// Export.image.toDrive({
+//   image: final_RF2.clip(studyArea),
+//   description: 'Ghana_classRF_'+scale+'m'+'2VarSplit_30Trees2019Full',
+//   region: studyArea,
+//   scale: 30,
+//   maxPixels: 1e13,
+//   skipEmptyTiles: true
+//   });
+
+
+//Mining Layer Only
+//------------------
+// Export.image.toDrive({
+//   image: final_mines.clip(studyArea),
+//   description: 'Ghana_mines_'+scale+'m'+'Cleaned2019Full',
+//   region: region,
+//   scale: 30,
+//   maxPixels: 1e13
+//   });
+
+
+//Stratified Random Samples
+//-------------------------
+// Export.table.toDrive({
+//   collection: stratPoints,
+//   description:'StratifiedrandomPoints',
+//   fileFormat: 'SHP',
+// });
+
+//Mining area for each protected area
+// Export.table.toDrive({
+//   collection: areaFunc,
+//   description:'MiningProtectedAreas',
+//   fileFormat: 'CSV',
+// });
+
+
+//****************************************************************************************************************************
+ 
+
+
+
+
+
+//=======================================================================================
+//STEP 7: Map results
+//=======================================================================================
+
+//Center map over Ghana
+//----------------------
+Map.centerObject(region, 6)
+
+
+//Set map to Satellite background
+//--------------------------------
+Map.setOptions('Satellite')
+
+
+//Landsat reference layers
+//-------------------------
+Map.addLayer(refImg,{min:0,max:3000,bands:(['B5','B3','B2'])},'Landsat Reference',false) // Check image Reference
+
+
+//Current Landsat imagery for visual comparison
+//---------------------------------------------
+Map.addLayer(currentImg, {min:0,max:3000,bands:(['B5','B3','B2'])},'Current Landsat',false)
+
+
+//NDVI anomaly results
+//---------------------
+Map.addLayer(anomImg.clip(region),{min: -0.20, max: 0,palette: ['FF0000', '000000']},'NDVI anomaly mean', false);
+
+
+//NDVI loss 2010-2019
+//--------------------
+Map.addLayer(lossImg.clip(region),{min: -0.20, max: -0.10,palette: ['FF0000']},'NDVI final loss image', false);
+
+
+//Random Forest Classification Results
+//------------------------------------
+//Display Classifications
+var palette = [
+  'green',//green - vegetated(0)
+  'yellow',//yellow - mining (1)
+  'red',//red - urban (2)
+  'blue'//blue - water (3)
+];
+
+Map.addLayer(RFExp.clip(studyArea),{min:0,max:3,palette: palette},'Final RF Classification', false);
+
+
+//Mining results only
+//---------------------
+Map.addLayer(final_mines.clip(studyArea),{palette: 'yellow'},'Gold Mines - final', false);
+
+
+//Footprints of WorldView Data used to classify points in QGIS
+//-------------------------------------------------------------
+//WorldView Image Dates and ID's:
+// 2019-01-04 === (42eb2e86753bc3c817e7753f6bfb2a88)
+// 2019-02-11 === (97a5dc39f9d832d8fc6b10df7beb9428)
+// 2019-04-09 === (c6f55d32bddf123748eb7b790c21332d)
+// 2019-04-12 === (46c044a38f7b14289ac0a6eaff782125)
+// 2019-05-12 === (c30701259b7b253b54d71b704fbd79e2)
+// 2019-06-08 === (8745238ab2701195efeddae449eec669)
+// 2019-12-23 === (15a28af324c59363c6685c4f29cc238e)
+// 2019-12-29 === (4a15c3082c522c13ea30a53cc958ba45)
+// 2019-12-31 === (5ea864f363e8a05e2361ef4d802040f0)
+
+
+Map.addLayer(worldView,{min:0,max:250,bands:(['b1','b2','b3'])}, 'World View Image Footprints',false)
+
+
+//Randomly sampled points used for accuracy assessment
+//----------------------------------------------------
+var empty = ee.Image().byte();
+var fills = empty.paint({
+  featureCollection: stratPoints,
+  color: 'classification_mode',
+  width: 30
+});
+
+Map.addLayer(fills, {palette: palette, min:0,max: 3}, 'Colored Validation Points', false);
+
+Map.addLayer(protArea,{color:'green',fill:'green'}, 'World Database of Protected Areas',false);
+
+Map.addLayer(numFixed)
+
+//****************************************************************************************************************************
+
+///END CODE///
