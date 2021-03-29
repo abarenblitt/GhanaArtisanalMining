@@ -1,10 +1,10 @@
 //=====================================================================================================================
-//                                        MIT - NASA - University of Maryland (ESSIC)
+//                                NASA - University of Maryland (ESSIC) - East Carolina University - MIT
 // Remote Sensing of Land Cover and Ecosystems: Country-level Ecosystem Extent and Change Mapping in Sub-Saharan Africa
 //                                                  
 // Project: Small-scale Gold Mining in Ghana 
 // Code: Ghana NDVI Anomaly Classification and Random Forest Classification
-// Written by: Amanda Payton, NASA Goddard 
+// Written by: Amanda Payton, East Carolina University 
 // Edited by: Abigail Barenblitt NASA Goddard and University of Maryland 
 // Co-authors: Daniel Wood, MIT; Lola Fatoyinbo, NASA Goddard; David Lagomasino, East Carolina University
 // Objective: This code identifies areas of anomalous NDVI in Ghana from 2008 to 2019 and classifies those areas
